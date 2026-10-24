@@ -4,9 +4,6 @@
 #
 # Uses uv to provide a standalone Python 3.14, so no root access, compiler,
 # or SQLite/OpenSSL development headers are required on the seedbox.
-#
-# The lock file and service use the name "uploadassistant" because the panel
-# derives a Python profile name from the lock filename.
 
 mkdir -p "$HOME/.logs" "$HOME/.install" "$HOME/.tmp"
 log="$HOME/.logs/upload-assistant.log"
@@ -23,11 +20,8 @@ UA_DIR="$HOME/scripts/Upload-Assistant"
 UA_DATA_DIR="$HOME/.local/share/Upload-Assistant"
 UA_CONFIG_DIR="$HOME/.config/upload-assistant"
 UA_BIN="$HOME/.local/bin/ua"
-SERVICE_NAME="uploadassistant"
-SERVICE="$HOME/.config/systemd/user/${SERVICE_NAME}.service"
-LOCK="$HOME/.install/.${SERVICE_NAME}.lock"
-PANEL_PROFILE="$UA_CONFIG_DIR/panel-profile.py"
-APP_PORT=""
+SERVICE="$HOME/.config/systemd/user/upload-assistant.service"
+LOCK="$HOME/.install/.upload-assistant.lock"
 DEV_TARBALL="https://github.com/wastaken7/Upload-Assistant/archive/refs/heads/development.tar.gz"
 
 function port() {
@@ -327,32 +321,6 @@ function _browse_roots() {
     _normalize_roots "$roots"
 }
 
-function _write_panel_profile() {
-    mkdir -p "$UA_CONFIG_DIR"
-    cat > "$PANEL_PROFILE" <<'PY'
-# Upload Assistant dashboard profile.
-# Add this class to the dashboard's profiles file (for example
-# /opt/swizzin/core/profiles_shared.py or /opt/swizzin/core/custom/profiles.py)
-# and restart the panel.
-class uploadassistant_meta:
-    name = "uploadassistant"
-    pretty_name = "Upload Assistant"
-    process = "ua"
-    systemd = "uploadassistant"
-    check_theD = True
-    scheme = "http"
-    multiuser = True
-
-    def __init__(self, user):
-        try:
-            with open(f"/home/{user}/.install/.uploadassistant.lock", encoding="utf-8") as handle:
-                self.port = int(handle.readline().strip())
-            self.baseurl = f":{self.port}/"
-        except Exception:
-            self.baseurl = False
-PY
-}
-
 function _service() {
     if ! command -v systemctl >/dev/null 2>&1; then
         _die "systemctl was not found. This installer requires systemd user services."
@@ -361,8 +329,9 @@ function _service() {
         _die "The 'ss' command was not found. Please ask your provider to install iproute2."
     fi
 
-    APP_PORT=$(port 10000 14000)
-    if [[ -z "$APP_PORT" ]]; then
+    local app_port
+    app_port=$(port 10000 14000)
+    if [[ -z "$app_port" ]]; then
         _die "Could not find a free port in the 10000-14000 range."
     fi
 
@@ -391,7 +360,7 @@ Environment=UA_DATA_DIR=$UA_DATA_DIR
 Environment="UA_BROWSE_ROOTS=$safe_roots"
 Environment=TMPDIR=$HOME/.tmp
 Environment=PYTHONUNBUFFERED=1
-ExecStart=$VENV/bin/ua --webui 0.0.0.0:$APP_PORT
+ExecStart=$VENV/bin/ua --webui 0.0.0.0:$app_port
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=30
@@ -410,21 +379,21 @@ EOF
     log_start=$(wc -l < "$log")
 
     systemctl --user daemon-reload >> "$log" 2>&1 || true
-    if ! systemctl --user enable --now "${SERVICE_NAME}.service" >> "$log" 2>&1; then
-        systemctl --user status "${SERVICE_NAME}.service" --no-pager >> "$log" 2>&1 || true
+    if ! systemctl --user enable --now upload-assistant.service >> "$log" 2>&1; then
+        systemctl --user status upload-assistant.service --no-pager >> "$log" 2>&1 || true
         tail -n 25 "$log"
-        _die "Failed to enable and start ${SERVICE_NAME}.service."
+        _die "Failed to enable and start upload-assistant.service."
     fi
 
     local _
     for _ in $(seq 1 30); do
-        systemctl --user is-active --quiet "${SERVICE_NAME}.service" && break
+        systemctl --user is-active --quiet upload-assistant.service && break
         sleep 1
     done
-    if ! systemctl --user is-active --quiet "${SERVICE_NAME}.service"; then
-        systemctl --user status "${SERVICE_NAME}.service" --no-pager >> "$log" 2>&1 || true
+    if ! systemctl --user is-active --quiet upload-assistant.service; then
+        systemctl --user status upload-assistant.service --no-pager >> "$log" 2>&1 || true
         tail -n 25 "$log"
-        _die "${SERVICE_NAME}.service did not stay running."
+        _die "upload-assistant.service did not stay running."
     fi
 
     local _
@@ -433,8 +402,6 @@ EOF
         tail -n "+$((log_start + 1))" "$log" 2>/dev/null | grep -qi 'setup code' && break
         sleep 1
     done
-
-    _write_panel_profile
 
     local domain
     domain=$(hostname -f 2>/dev/null)
@@ -446,7 +413,7 @@ EOF
 
     echo ""
     echo "Upload Assistant is installed and running."
-    echo "WebUI: http://${domain}:${APP_PORT}/"
+    echo "WebUI: http://${domain}:${app_port}/"
     if [[ -n "$setup_code" ]]; then
         echo "First-run setup code: ${setup_code}"
     elif [[ -f "$UA_CONFIG_DIR/webui_auth.json" ]]; then
@@ -461,11 +428,8 @@ EOF
     echo "Browse roots: ${roots}"
     echo "Config: ${UA_DATA_DIR}/data/config.py"
     echo "WebUI account data: ${UA_CONFIG_DIR}"
-    echo "Dashboard profile: ${PANEL_PROFILE}"
-    echo "  If Upload Assistant does not appear in your provider's dashboard, send"
-    echo "  that file to support so they can add it and restart the panel."
     echo "Logs: ${log}"
-    echo "Service: systemctl --user status ${SERVICE_NAME}"
+    echo "Service: systemctl --user status upload-assistant"
 
     local qb_conf="$HOME/.config/qBittorrent/qBittorrent.conf"
     if [[ -f "$qb_conf" ]]; then
@@ -504,7 +468,7 @@ function _install() {
 
     _service
 
-    printf '%s\nchannel=%s\n' "$APP_PORT" "$channel" > "$LOCK"
+    echo "channel=${channel}" > "$LOCK"
     echo ""
     echo "Installation complete."
 }
@@ -525,27 +489,27 @@ function _upgrade() {
         echo "Warning: ffmpeg is not available. Uploads that need screenshots will fail until it is installed."
     fi
 
-    echo "Stopping ${SERVICE_NAME}.service..."
-    systemctl --user stop "${SERVICE_NAME}.service" >> "$log" 2>&1 || true
+    echo "Stopping upload-assistant.service..."
+    systemctl --user stop upload-assistant.service >> "$log" 2>&1 || true
 
     if ! _install_app "$channel"; then
         echo "Upgrade failed. Attempting to restart the previous installation..."
-        systemctl --user start "${SERVICE_NAME}.service" >> "$log" 2>&1 || true
+        systemctl --user start upload-assistant.service >> "$log" 2>&1 || true
         _die "Upgrade failed."
     fi
 
     systemctl --user daemon-reload >> "$log" 2>&1 || true
-    if ! systemctl --user start "${SERVICE_NAME}.service" >> "$log" 2>&1; then
-        systemctl --user status "${SERVICE_NAME}.service" --no-pager >> "$log" 2>&1 || true
+    if ! systemctl --user start upload-assistant.service >> "$log" 2>&1; then
+        systemctl --user status upload-assistant.service --no-pager >> "$log" 2>&1 || true
         tail -n 25 "$log"
         _die "Upload Assistant was upgraded but the service failed to start."
     fi
 
     sleep 2
-    if ! systemctl --user is-active --quiet "${SERVICE_NAME}.service"; then
-        systemctl --user status "${SERVICE_NAME}.service" --no-pager >> "$log" 2>&1 || true
+    if ! systemctl --user is-active --quiet upload-assistant.service; then
+        systemctl --user status upload-assistant.service --no-pager >> "$log" 2>&1 || true
         tail -n 25 "$log"
-        _die "${SERVICE_NAME}.service did not stay running after the upgrade."
+        _die "upload-assistant.service did not stay running after the upgrade."
     fi
 
     local app_port=""
@@ -570,10 +534,10 @@ function _remove() {
     fi
 
     echo "Removing Upload Assistant..."
-    systemctl --user disable --now "${SERVICE_NAME}.service" >> "$log" 2>&1 || true
+    systemctl --user disable --now upload-assistant.service >> "$log" 2>&1 || true
     rm -f "$SERVICE"
     systemctl --user daemon-reload >> "$log" 2>&1 || true
-    systemctl --user reset-failed "${SERVICE_NAME}.service" >> "$log" 2>&1 || true
+    systemctl --user reset-failed upload-assistant.service >> "$log" 2>&1 || true
 
     if [[ -L "$UA_BIN" ]]; then
         local target
