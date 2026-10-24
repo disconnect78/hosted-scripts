@@ -2,8 +2,9 @@
 # Upload Assistant installer for SBIO/Swizzin Hosted
 # https://github.com/wastaken7/Upload-Assistant
 #
-# Uses pyenv for Python 3.14 (the same approach as Upload Assistant's
-# install-seedbox.sh) and adds a systemd user service for the WebUI.
+# Uses pyenv when the SQLite/OpenSSL build headers are available. On slots
+# without those headers (the common appbox case), it falls back to a
+# uv-managed standalone Python, which includes sqlite3 and needs no root.
 
 mkdir -p "$HOME/.logs" "$HOME/.install" "$HOME/.tmp"
 log="$HOME/.logs/upload-assistant.log"
@@ -15,6 +16,8 @@ export PYENV_ROOT="$HOME/.local/opt/pyenv"
 export PATH="$HOME/.local/bin:$PYENV_ROOT/bin:$PATH"
 
 PYTHON_VERSION="3.14.0"
+PYTHON_MINOR="3.14"
+UV_BIN=""
 VENV="$HOME/.venv/upload-assistant"
 UA_DIR="$HOME/scripts/Upload-Assistant"
 UA_DATA_DIR="$HOME/.local/share/Upload-Assistant"
@@ -46,25 +49,80 @@ function _add_bashrc() {
     grep -qxF "$line" "$HOME/.bashrc" 2>/dev/null || echo "$line" >> "$HOME/.bashrc"
 }
 
-function _deps() {
-    local cmd
-    for cmd in git curl tar xz; do
-        if ! command -v "$cmd" >/dev/null 2>&1; then
-            _die "Required command not found: ${cmd}. Please ask your provider to install it."
-        fi
-    done
+function _venv_ok() {
+    [[ -x "$VENV/bin/python" ]] || return 1
+    "$VENV/bin/python" -c 'import sys, sqlite3, ssl; raise SystemExit(0 if sys.version_info[:2] >= (3, 14) else 1)' >/dev/null 2>&1
+}
+
+function _ensure_uv() {
+    if [[ -n "$UV_BIN" && -x "$UV_BIN" ]]; then
+        return 0
+    fi
+    if command -v uv >/dev/null 2>&1; then
+        UV_BIN=$(command -v uv)
+        return 0
+    fi
+    if [[ -x "$HOME/.local/bin/uv" ]]; then
+        UV_BIN="$HOME/.local/bin/uv"
+        return 0
+    fi
+
+    local installer="$TMPDIR/uv-install.sh"
+    echo "Installing uv..."
+    if ! curl -LsSf https://astral.sh/uv/install.sh -o "$installer" >> "$log" 2>&1; then
+        echo "Failed to download the uv installer."
+        return 1
+    fi
+    if ! UV_INSTALL_DIR="$HOME/.local/bin" sh "$installer" >> "$log" 2>&1; then
+        rm -f "$installer"
+        echo "Failed to install uv."
+        return 1
+    fi
+    rm -f "$installer"
+
+    if command -v uv >/dev/null 2>&1; then
+        UV_BIN=$(command -v uv)
+    elif [[ -x "$HOME/.local/bin/uv" ]]; then
+        UV_BIN="$HOME/.local/bin/uv"
+    else
+        echo "uv was installed but could not be found."
+        return 1
+    fi
 
     # shellcheck disable=SC2016
     _add_bashrc 'export PATH="$HOME/.local/bin:$PATH"'
+}
 
+function _pip() {
+    local subcmd=$1
+    shift
+    if "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+        "$VENV/bin/python" -m pip "$subcmd" "$@"
+    else
+        _ensure_uv || return 1
+        "$UV_BIN" pip "$subcmd" --python "$VENV/bin/python" "$@"
+    fi
+}
+
+function _pyenv_capable() {
+    local cmd
+    for cmd in git tar xz gcc make; do
+        command -v "$cmd" >/dev/null 2>&1 || return 1
+    done
+    printf '#include <sqlite3.h>\n#include <openssl/ssl.h>\n' | gcc -E -x c - >/dev/null 2>&1
+}
+
+function _install_pyenv_python() {
     if [[ ! -d "$PYENV_ROOT" ]]; then
         echo "Installing pyenv..."
         mkdir -p "$HOME/.local/opt"
         git clone https://github.com/pyenv/pyenv.git "$PYENV_ROOT" >> "$log" 2>&1 || {
-            _die "Failed to clone pyenv."
+            echo "Failed to clone pyenv."
+            return 1
         }
     elif [[ ! -d "$PYENV_ROOT/.git" ]]; then
-        _die "${PYENV_ROOT} exists but is not a pyenv checkout."
+        echo "${PYENV_ROOT} exists but is not a pyenv checkout."
+        return 1
     fi
 
     if [[ ! -d "$PYENV_ROOT/plugins/pyenv-virtualenv" ]]; then
@@ -80,50 +138,90 @@ function _deps() {
     _add_bashrc 'export PATH="$PYENV_ROOT/bin:$PATH"'
 
     if [[ ! -x "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" ]]; then
-        for cmd in gcc make; do
-            if ! command -v "$cmd" >/dev/null 2>&1; then
-                _die "Required build command not found: ${cmd}. Please ask your provider to install it before compiling Python."
-            fi
-        done
-
         echo "Updating pyenv definitions..."
         git -C "$PYENV_ROOT" pull --ff-only >> "$log" 2>&1 || true
 
         echo "Compiling Python ${PYTHON_VERSION}. This may take 10-20+ minutes..."
         if ! "$PYENV_ROOT/bin/pyenv" install "$PYTHON_VERSION" >> "$log" 2>&1; then
             tail -n 25 "$log"
-            _die "Failed to compile Python ${PYTHON_VERSION}."
+            echo "Failed to compile Python ${PYTHON_VERSION}."
+            return 1
         fi
         echo "Python ${PYTHON_VERSION} installed."
     else
         echo "Python ${PYTHON_VERSION} is already installed."
     fi
 
-    if ! "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" -c 'import ssl' >/dev/null 2>&1; then
-        _die "Python ${PYTHON_VERSION} was built without SSL support. Ask your provider to install the OpenSSL development headers (libssl-dev) and rerun this installer."
+    if ! "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" -c 'import sqlite3, ssl' >/dev/null 2>&1; then
+        echo "The pyenv Python ${PYTHON_VERSION} is missing sqlite3 or ssl support."
+        return 1
     fi
 
     mkdir -p "$HOME/.venv"
-    if [[ -x "$VENV/bin/python" ]]; then
-        local venv_version
-        venv_version=$("$VENV/bin/python" -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null)
-        if [[ "$venv_version" != "$PYTHON_VERSION" ]]; then
-            echo "Existing virtualenv uses Python ${venv_version}; recreating it."
+    echo "Creating virtualenv..."
+    "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" -m venv "$VENV" >> "$log" 2>&1 || {
+        echo "Failed to create the virtualenv."
+        return 1
+    }
+}
+
+function _install_uv_python() {
+    _ensure_uv || return 1
+    mkdir -p "$HOME/.venv"
+
+    echo "Installing Python ${PYTHON_MINOR} with uv..."
+    if ! "$UV_BIN" python install "$PYTHON_MINOR" >> "$log" 2>&1; then
+        echo "Failed to install Python ${PYTHON_MINOR} with uv."
+        return 1
+    fi
+
+    echo "Creating virtualenv..."
+    local managed=()
+    if "$UV_BIN" venv --help 2>/dev/null | grep -q -- '--managed-python'; then
+        managed=(--managed-python)
+    fi
+    if ! "$UV_BIN" venv --python "$PYTHON_MINOR" "${managed[@]}" "$VENV" >> "$log" 2>&1; then
+        echo "Failed to create the uv virtualenv."
+        return 1
+    fi
+
+    _venv_ok
+}
+
+function _deps() {
+    if ! command -v curl >/dev/null 2>&1; then
+        _die "Required command not found: curl. Please ask your provider to install it."
+    fi
+
+    if _venv_ok; then
+        echo "Using existing Python environment."
+    else
+        if [[ -e "$VENV" ]]; then
+            echo "Existing virtualenv is missing required modules; recreating it."
             rm -rf "$VENV"
+        fi
+        mkdir -p "$HOME/.venv"
+
+        if _pyenv_capable; then
+            echo "SQLite and OpenSSL build headers found; using pyenv Python ${PYTHON_VERSION}."
+            if ! _install_pyenv_python; then
+                echo "pyenv Python setup failed; falling back to uv-managed Python ${PYTHON_MINOR}."
+                rm -rf "$VENV"
+                _install_uv_python || _die "Failed to create a Python ${PYTHON_MINOR} environment."
+            fi
+        else
+            echo "SQLite/OpenSSL build headers or build tools not found; using uv-managed Python ${PYTHON_MINOR}."
+            if [[ -x "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" ]] \
+                && ! "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" -c 'import sqlite3' >/dev/null 2>&1; then
+                echo "Note: the existing pyenv Python ${PYTHON_VERSION} is missing sqlite3 and will not be used."
+                echo "Remove it with: ${PYENV_ROOT}/bin/pyenv uninstall ${PYTHON_VERSION}"
+            fi
+            _install_uv_python || _die "Failed to create a Python ${PYTHON_MINOR} environment."
         fi
     fi
 
-    if [[ ! -x "$VENV/bin/python" ]]; then
-        echo "Creating virtualenv..."
-        "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" -m venv "$VENV" >> "$log" 2>&1 || {
-            _die "Failed to create the virtualenv."
-        }
-    fi
-
-    echo "Updating pip and wheel..."
-    "$VENV/bin/python" -m pip install --upgrade pip wheel >> "$log" 2>&1 || {
-        _die "Failed to update pip/wheel."
-    }
+    _venv_ok || _die "The Python environment is missing sqlite3 or ssl support."
+    _pip install --upgrade pip wheel >> "$log" 2>&1 || _die "Failed to update pip/wheel."
 }
 
 function _ffmpeg() {
@@ -142,6 +240,11 @@ function _ffmpeg() {
             return 1
             ;;
     esac
+
+    if ! command -v tar >/dev/null 2>&1 || ! command -v xz >/dev/null 2>&1; then
+        echo "ffmpeg is missing, and tar/xz are required to extract the static fallback."
+        return 1
+    fi
 
     echo "ffmpeg/ffprobe not found. Downloading a static build (about 150 MB)..."
     mkdir -p "$HOME/.local/opt/ffmpeg" "$HOME/.local/bin"
@@ -175,13 +278,18 @@ function _ffmpeg() {
 
 function _install_stable() {
     echo "Installing the latest stable Upload Assistant release..."
-    if ! "$VENV/bin/python" -m pip install --upgrade upload-assistant >> "$log" 2>&1; then
+    if ! _pip install --upgrade upload-assistant >> "$log" 2>&1; then
         echo "Failed to install the stable Upload Assistant release."
         return 1
     fi
 }
 
 function _install_dev() {
+    if ! command -v tar >/dev/null 2>&1; then
+        echo "Required command not found: tar."
+        return 1
+    fi
+
     echo "Downloading the Upload Assistant development branch..."
     mkdir -p "$HOME/scripts"
     local tmp_dir="$TMPDIR/ua-dev-$$"
@@ -204,7 +312,7 @@ function _install_dev() {
     rm -rf "$tmp_dir"
 
     echo "Installing Upload Assistant from the development branch..."
-    if ! "$VENV/bin/python" -m pip install --upgrade --force-reinstall "$UA_DIR" >> "$log" 2>&1; then
+    if ! _pip install --upgrade --force-reinstall "$UA_DIR" >> "$log" 2>&1; then
         echo "Failed to install the development branch."
         return 1
     fi
@@ -517,10 +625,6 @@ function _remove() {
         fi
     fi
 
-    if [[ -x "$VENV/bin/python" ]]; then
-        "$VENV/bin/python" -m pip uninstall -y upload-assistant >> "$log" 2>&1 || true
-    fi
-
     rm -rf "$VENV"
     rm -rf "$UA_DIR"
     rm -f "$LOCK"
@@ -540,8 +644,14 @@ function _remove() {
     esac
 
     echo "Upload Assistant has been removed."
-    echo "Python ${PYTHON_VERSION} was left installed for other applications."
-    echo "Remove it with: ${PYENV_ROOT}/bin/pyenv uninstall ${PYTHON_VERSION}"
+    if [[ -x "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" ]]; then
+        echo "pyenv Python ${PYTHON_VERSION} was left installed for other applications."
+        echo "Remove it with: ${PYENV_ROOT}/bin/pyenv uninstall ${PYTHON_VERSION}"
+    fi
+    if command -v uv >/dev/null 2>&1 || [[ -x "$HOME/.local/bin/uv" ]]; then
+        echo "uv and its managed Python were left installed."
+        echo "Remove the managed Python with: uv python uninstall ${PYTHON_MINOR}"
+    fi
     echo "Static ffmpeg, if installed, was left at ${HOME}/.local/opt/ffmpeg"
 }
 
