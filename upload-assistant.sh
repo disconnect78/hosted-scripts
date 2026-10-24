@@ -2,9 +2,8 @@
 # Upload Assistant installer for SBIO/Swizzin Hosted
 # https://github.com/wastaken7/Upload-Assistant
 #
-# Uses pyenv when the SQLite/OpenSSL build headers are available. On slots
-# without those headers (the common appbox case), it falls back to a
-# uv-managed standalone Python, which includes sqlite3 and needs no root.
+# Uses uv to provide a standalone Python 3.14, so no root access, compiler,
+# or SQLite/OpenSSL development headers are required on the seedbox.
 
 mkdir -p "$HOME/.logs" "$HOME/.install" "$HOME/.tmp"
 log="$HOME/.logs/upload-assistant.log"
@@ -12,10 +11,8 @@ touch "$log"
 chmod 600 "$log" 2>/dev/null || true
 
 export TMPDIR="$HOME/.tmp"
-export PYENV_ROOT="$HOME/.local/opt/pyenv"
-export PATH="$HOME/.local/bin:$PYENV_ROOT/bin:$PATH"
+export PATH="$HOME/.local/bin:$PATH"
 
-PYTHON_VERSION="3.14.0"
 PYTHON_MINOR="3.14"
 UV_BIN=""
 VENV="$HOME/.venv/upload-assistant"
@@ -104,68 +101,7 @@ function _pip() {
     fi
 }
 
-function _pyenv_capable() {
-    local cmd
-    for cmd in git tar xz gcc make; do
-        command -v "$cmd" >/dev/null 2>&1 || return 1
-    done
-    printf '#include <sqlite3.h>\n#include <openssl/ssl.h>\n' | gcc -E -x c - >/dev/null 2>&1
-}
-
-function _install_pyenv_python() {
-    if [[ ! -d "$PYENV_ROOT" ]]; then
-        echo "Installing pyenv..."
-        mkdir -p "$HOME/.local/opt"
-        git clone https://github.com/pyenv/pyenv.git "$PYENV_ROOT" >> "$log" 2>&1 || {
-            echo "Failed to clone pyenv."
-            return 1
-        }
-    elif [[ ! -d "$PYENV_ROOT/.git" ]]; then
-        echo "${PYENV_ROOT} exists but is not a pyenv checkout."
-        return 1
-    fi
-
-    if [[ ! -d "$PYENV_ROOT/plugins/pyenv-virtualenv" ]]; then
-        git clone https://github.com/pyenv/pyenv-virtualenv.git "$PYENV_ROOT/plugins/pyenv-virtualenv" >> "$log" 2>&1 || true
-    fi
-    if [[ ! -d "$PYENV_ROOT/plugins/pyenv-update" ]]; then
-        git clone https://github.com/pyenv/pyenv-update.git "$PYENV_ROOT/plugins/pyenv-update" >> "$log" 2>&1 || true
-    fi
-
-    # shellcheck disable=SC2016
-    _add_bashrc 'export PYENV_ROOT="$HOME/.local/opt/pyenv"'
-    # shellcheck disable=SC2016
-    _add_bashrc 'export PATH="$PYENV_ROOT/bin:$PATH"'
-
-    if [[ ! -x "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" ]]; then
-        echo "Updating pyenv definitions..."
-        git -C "$PYENV_ROOT" pull --ff-only >> "$log" 2>&1 || true
-
-        echo "Compiling Python ${PYTHON_VERSION}. This may take 10-20+ minutes..."
-        if ! "$PYENV_ROOT/bin/pyenv" install "$PYTHON_VERSION" >> "$log" 2>&1; then
-            tail -n 25 "$log"
-            echo "Failed to compile Python ${PYTHON_VERSION}."
-            return 1
-        fi
-        echo "Python ${PYTHON_VERSION} installed."
-    else
-        echo "Python ${PYTHON_VERSION} is already installed."
-    fi
-
-    if ! "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" -c 'import sqlite3, ssl' >/dev/null 2>&1; then
-        echo "The pyenv Python ${PYTHON_VERSION} is missing sqlite3 or ssl support."
-        return 1
-    fi
-
-    mkdir -p "$HOME/.venv"
-    echo "Creating virtualenv..."
-    "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" -m venv "$VENV" >> "$log" 2>&1 || {
-        echo "Failed to create the virtualenv."
-        return 1
-    }
-}
-
-function _install_uv_python() {
+function _install_python() {
     _ensure_uv || return 1
     mkdir -p "$HOME/.venv"
 
@@ -175,12 +111,18 @@ function _install_uv_python() {
         return 1
     fi
 
-    echo "Creating virtualenv..."
-    local managed=()
+    local managed=() clear=()
     if "$UV_BIN" venv --help 2>/dev/null | grep -q -- '--managed-python'; then
         managed=(--managed-python)
     fi
-    if ! "$UV_BIN" venv --python "$PYTHON_MINOR" "${managed[@]}" "$VENV" >> "$log" 2>&1; then
+    if "$UV_BIN" venv --help 2>/dev/null | grep -q -- '--clear'; then
+        clear=(--clear)
+    else
+        rm -rf "$VENV"
+    fi
+
+    echo "Creating virtualenv..."
+    if ! "$UV_BIN" venv --python "$PYTHON_MINOR" "${managed[@]}" "${clear[@]}" "$VENV" >> "$log" 2>&1; then
         echo "Failed to create the uv virtualenv."
         return 1
     fi
@@ -196,28 +138,8 @@ function _deps() {
     if _venv_ok; then
         echo "Using existing Python environment."
     else
-        if [[ -e "$VENV" ]]; then
-            echo "Existing virtualenv is missing required modules; recreating it."
-            rm -rf "$VENV"
-        fi
-        mkdir -p "$HOME/.venv"
-
-        if _pyenv_capable; then
-            echo "SQLite and OpenSSL build headers found; using pyenv Python ${PYTHON_VERSION}."
-            if ! _install_pyenv_python; then
-                echo "pyenv Python setup failed; falling back to uv-managed Python ${PYTHON_MINOR}."
-                rm -rf "$VENV"
-                _install_uv_python || _die "Failed to create a Python ${PYTHON_MINOR} environment."
-            fi
-        else
-            echo "SQLite/OpenSSL build headers or build tools not found; using uv-managed Python ${PYTHON_MINOR}."
-            if [[ -x "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" ]] \
-                && ! "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" -c 'import sqlite3' >/dev/null 2>&1; then
-                echo "Note: the existing pyenv Python ${PYTHON_VERSION} is missing sqlite3 and will not be used."
-                echo "Remove it with: ${PYENV_ROOT}/bin/pyenv uninstall ${PYTHON_VERSION}"
-            fi
-            _install_uv_python || _die "Failed to create a Python ${PYTHON_MINOR} environment."
-        fi
+        echo "Creating a fresh Python ${PYTHON_MINOR} environment with uv..."
+        _install_python || _die "Failed to create a Python ${PYTHON_MINOR} environment."
     fi
 
     _venv_ok || _die "The Python environment is missing sqlite3 or ssl support."
@@ -644,10 +566,6 @@ function _remove() {
     esac
 
     echo "Upload Assistant has been removed."
-    if [[ -x "$PYENV_ROOT/versions/${PYTHON_VERSION}/bin/python3" ]]; then
-        echo "pyenv Python ${PYTHON_VERSION} was left installed for other applications."
-        echo "Remove it with: ${PYENV_ROOT}/bin/pyenv uninstall ${PYTHON_VERSION}"
-    fi
     if command -v uv >/dev/null 2>&1 || [[ -x "$HOME/.local/bin/uv" ]]; then
         echo "uv and its managed Python were left installed."
         echo "Remove the managed Python with: uv python uninstall ${PYTHON_MINOR}"
