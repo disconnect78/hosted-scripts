@@ -199,8 +199,14 @@ function _ffmpeg() {
 }
 
 function _install_stable() {
+    local force=${1:-false}
+    local -a pip_args=(--upgrade)
+    if [[ "$force" == "true" ]]; then
+        pip_args+=(--force-reinstall)
+    fi
+
     echo "Installing the latest stable Upload Assistant release..."
-    if ! _pip install --upgrade upload-assistant >> "$log" 2>&1; then
+    if ! _pip install "${pip_args[@]}" upload-assistant >> "$log" 2>&1; then
         echo "Failed to install the stable Upload Assistant release."
         return 1
     fi
@@ -242,9 +248,10 @@ function _install_dev() {
 
 function _install_app() {
     local channel=$1
+    local force=${2:-false}
 
     case "$channel" in
-        stable) _install_stable || return 1 ;;
+        stable) _install_stable "$force" || return 1 ;;
         development) _install_dev || return 1 ;;
         *)
             echo "Unknown install channel: ${channel}"
@@ -452,7 +459,7 @@ function _install() {
     local channel=$1
 
     if [[ -f "$LOCK" ]]; then
-        echo "Upload Assistant is already installed. Use 'upgrade' instead, or uninstall first to switch installation channels."
+        echo "Upload Assistant is already installed. Use 'upgrade' to update it or 'switch' to change channels."
         exit 0
     fi
 
@@ -527,6 +534,67 @@ function _upgrade() {
     fi
 }
 
+function _switch() {
+    if [[ ! -f "$LOCK" ]]; then
+        echo "Upload Assistant is not installed."
+        exit 0
+    fi
+
+    local current target service_name app_port domain
+    current=$(sed -n 's/^channel=//p' "$LOCK" 2>/dev/null | head -n 1)
+    [[ -z "$current" ]] && current="stable"
+    if [[ "$current" == "development" ]]; then
+        target="stable"
+    else
+        target="development"
+    fi
+
+    if [[ ! -f "$SERVICE" ]]; then
+        _die "The systemd service file is missing. Reinstall Upload Assistant to recreate it."
+    fi
+
+    echo "Switching from ${current} to ${target}."
+    echo "Active WebUI uploads will be stopped."
+    _deps
+
+    if ! _ffmpeg; then
+        echo "Warning: ffmpeg is not available. Uploads that need screenshots will fail until it is installed."
+    fi
+
+    service_name=$(basename "$SERVICE" .service)
+    systemctl --user stop "${service_name}.service" >> "$log" 2>&1 || true
+
+    if ! _install_app "$target" true; then
+        echo "Switch failed. Attempting to restart the ${current} installation..."
+        systemctl --user start "${service_name}.service" >> "$log" 2>&1 || true
+        _die "Failed to switch to ${target}."
+    fi
+
+    echo "channel=${target}" > "$LOCK"
+    systemctl --user daemon-reload >> "$log" 2>&1 || true
+    if ! systemctl --user start "${service_name}.service" >> "$log" 2>&1; then
+        systemctl --user status "${service_name}.service" --no-pager >> "$log" 2>&1 || true
+        tail -n 25 "$log"
+        _die "Switched to ${target}, but the service failed to start."
+    fi
+
+    sleep 2
+    if ! systemctl --user is-active --quiet "${service_name}.service"; then
+        systemctl --user status "${service_name}.service" --no-pager >> "$log" 2>&1 || true
+        tail -n 25 "$log"
+        _die "${service_name}.service did not stay running after the switch."
+    fi
+
+    app_port=$(sed -n 's/.*--webui 0\.0\.0\.0:\([0-9]*\).*/\1/p' "$SERVICE" | head -n 1)
+    domain=$(hostname -f 2>/dev/null)
+    [[ -z "$domain" ]] && domain=$(hostname)
+
+    echo "Switch complete: ${current} -> ${target}."
+    if [[ -n "$app_port" ]]; then
+        echo "WebUI: http://${domain}:${app_port}/"
+    fi
+}
+
 function _remove() {
     if [[ ! -f "$LOCK" && ! -f "$SERVICE" ]]; then
         echo "Upload Assistant is not installed."
@@ -593,6 +661,7 @@ echo "Logs are stored at ${log}"
 echo "install = Install the latest stable release"
 echo "install-dev = Install the development branch (includes the console setup code)"
 echo "upgrade = Upgrade an existing installation"
+echo "switch = Switch between stable and development channels"
 echo "uninstall = Completely removes Upload Assistant"
 echo "exit = Exits Installer"
 echo ""
@@ -610,6 +679,10 @@ while true; do
             ;;
         "upgrade")
             _upgrade
+            break
+            ;;
+        "switch")
+            _switch
             break
             ;;
         "uninstall")
